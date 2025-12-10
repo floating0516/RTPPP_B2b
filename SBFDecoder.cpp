@@ -13,6 +13,8 @@ static const unsigned char SBF_SYNC2 = 0x40; // '@'
 
 SBFDecoder::SBFDecoder(const QByteArray &staID) : _staID(staID) {
   _b2bDec = new PPPB2bDecoder();
+  if (_b2bDec) _b2bDec->setStaID(_staID);
+  if (_b2bDec) _b2bDec->setVerboseSatPrint(false);
 }
 SBFDecoder::~SBFDecoder() {
   delete _b2bDec;

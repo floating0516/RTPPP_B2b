@@ -74,6 +74,8 @@ static int syssig_prn(int prn) {
     return a;
 }
 
+bool g_b2bDebugSatPrint = false;
+
 PPPB2bDecoder::PPPB2bDecoder() {
     // Initialize state variables
     ssr_clock_count = 0;
@@ -84,17 +86,16 @@ PPPB2bDecoder::PPPB2bDecoder() {
     memset(ssr_masks, 0, sizeof(ssr_masks));
     memset(&ssr_config, 0, sizeof(ssr_config));
 
-    // Initialize config (simulated gnssinit call without file ops for now, or default values)
-    // We don't open files here as per original b2b-decoder which took file paths.
-    // If specific initialization is needed, it can be added here.
-    // strcpy(ssr_config.Machine_number, "sz001");
-    // strcpy(ssr_config.Site_number, "BJ03");
-    // strcpy(ssr_config.DATA_PPP_FILENAME, "b2b_outfile");
     gnssinit(nullptr, nullptr);
 
     // Initialize RTCM3 structures
     memset(&_clkOrb, 0, sizeof(_clkOrb));
     _staID = "B2b_SSR";
+    _epochWeek = 0;
+    _epochTow = 0;
+    _epochC59Avail = false;
+    _epochC60Avail = false;
+    _epochC61Avail = false;
 }
 
 PPPB2bDecoder::~PPPB2bDecoder() {
@@ -106,6 +107,14 @@ PPPB2bDecoder::~PPPB2bDecoder() {
     _orbCorrections.clear();
     _clkCorrections.clear();
     _lastClkCorrections.clear();
+}
+
+void PPPB2bDecoder::setStaID(const QString& staID) {
+    _staID = staID;
+}
+
+void PPPB2bDecoder::setVerboseSatPrint(bool enabled) {
+    g_b2bDebugSatPrint = enabled;
 }
 
 uint16_t PPPB2bDecoder::U2(const uint8_t* p) const { uint16_t u; memcpy(&u,p,2); return u; }
@@ -247,9 +256,17 @@ int PPPB2bDecoder::decode_b2b_payload(const uint8_t* payload, int payload_len) {
   uint8_t  Src   = *(payload + 9);
   uint8_t  RxCh  = *(payload + 11);
   QString prnMask = svid2prn(SVIDb);
-
-  if (prnMask=="C59")
-  {
+  if (_epochWeek != WNc || _epochTow != TOW) {
+    _epochWeek = WNc;
+    _epochTow = TOW;
+    _epochC59Avail = false;
+    _epochC60Avail = false;
+    _epochC61Avail = false;
+  }
+  bool isC59 = (prnMask == "C59");
+  bool isC60 = (prnMask == "C60");
+  bool isC61 = (prnMask == "C61");
+  if (isC59 || isC60 || isC61) {
     QString head = QString("PPPB2b: TOW=%1 WNc=%2 PRN=%3 CRCPassed=%4 Src=%5 RxCh=%6")
                    .arg(TOW).arg(WNc).arg(svid2prn(SVIDb)).arg((int)CRCp).arg((int)Src).arg((int)RxCh);
     BNC_CORE->slotMessage(head.toUtf8(), false);
@@ -283,17 +300,22 @@ int PPPB2bDecoder::decode_b2b_payload(const uint8_t* payload, int payload_len) {
         previewEsc += QString("%1").arg((unsigned char)preview.at(i), 2, 16, QLatin1Char('0')).toUpper();
       }
       previewEsc += "'";
-      QString out = QString("C59 NAVBits decoded preview (%1 bytes): %2")
+      QString out = QString("%1 NAVBits decoded preview (%2 bytes): %3")
+                      .arg(isC59 ? "C59" : (isC60 ? "C60" : "C61"))
                       .arg(previewN)
                       .arg(toRawArray(parseBytesLiteral(previewEsc)));
       BNC_CORE->slotMessage(out.toUtf8(), false);
 
       // Use the decoded data with the new C-based logic
       if (decoded.size() > 0) {
+          if ((isC60 && _epochC59Avail) || (isC61 && (_epochC59Avail || _epochC60Avail))) {
+              BNC_CORE->slotMessage(QString("Skip %1 at epoch due to higher-priority available").arg(isC60 ? "C60" : "C61").toUtf8(), false);
+              return 1;
+          }
           // Construct Message_header for b2b_parsecorr
           struct Message_header mh;
           memset(&mh, 0, sizeof(mh));
-          mh.current_PRN = 59; // As per b2b_ifsystem logic for PPP
+          mh.current_PRN = isC59 ? 59 : (isC60 ? 60 : 61);
           mh.current_week_second.BDSweek = WNc;
           // Note: TOW from SBF is in seconds, but b2b_parsecorr expects BDSsecond/sow logic.
           // Here we pass the TOW as received.
@@ -324,6 +346,7 @@ int PPPB2bDecoder::decode_b2b_payload(const uint8_t* payload, int payload_len) {
           // Call b2b_parsecorr
           bool res = b2b_parsecorr(&mh);
           if (res) {
+             if (isC59) _epochC59Avail = true; else if (isC60) _epochC60Avail = true; else _epochC61Avail = true;
              // Debug Output: Check Time Sync
              QDateTime sysTime = BNC_CORE->dateAndTimeGPS();
              QString msg = QString("B2b Time: %1, Sys Time: %2, Diff: %3 s")
@@ -641,6 +664,19 @@ void PPPB2bDecoder::b2b_fillmem(pppdata* p_sbas) {
             if(fabs(fabs(ptr_clk->C0[prn]) - 26.2128) < 0.01) continue;
             ptr_clk->iodcorr[prn] = p_sbas->type.type4.IDO_corr[i];
             ptr_clk->iode[prn] = b2b_updateiode(ptr_clk->SSR, prn, ptr_clk->iodcorr[prn]);
+            {
+              double dClk = ptr_clk->C0[prn] / t_CST::c;
+              int sysIdx = syssig_prn(prn + 1);
+              char sysCh = (sysIdx==0?'C':(sysIdx==1?'G':(sysIdx==2?'E':(sysIdx==3?'R':'?'))));
+              int prnNum = satslot_prn(prn + 1);
+              QString clkMsg = QString("CLK Corr: %1%2 C0=%3 m dClk=%4 s IOD=%5")
+                                .arg(sysCh)
+                                .arg(prnNum, 2, 10, QLatin1Char('0'))
+                                .arg(ptr_clk->C0[prn], 0, 'f', 4)
+                                .arg(dClk, 0, 'e', 6)
+                                .arg(ptr_clk->iode[prn]);
+              BNC_CORE->slotMessage(clkMsg.toUtf8(), false);
+            }
         }
         m_outclock(ptr_clk);
         BNC_CORE->slotMessage(QString("MT4 CLOCK processed for SSR=%1").arg(p_sbas->SSR).toUtf8(), false);
@@ -868,31 +904,29 @@ void PPPB2bDecoder::emitCorrections(const pppdata* p_sbas) {
     // If message type is 4 (Clock), buffer clock corrections
     if (p_sbas->mestype == 4 && current_clocks) {
         for(int isat = 0; isat < IF_MAXSAT; isat++) {
-            if(current_clocks->iode[isat] == -1) continue;
-            
+            // Accept clock even if IODE is unknown; PPP will handle BDS/G/E/R differently
             int sysIdx = syssig_prn(isat + 1);
             if (sysIdx < 0) continue;
-            
-            char sysCh = ' ';
-            if (sysIdx == 0) sysCh = 'C';
-            else if (sysIdx == 1) sysCh = 'G';
+
+            char sysCh = 'C';
+            if (sysIdx == 1) sysCh = 'G';
             else if (sysIdx == 2) sysCh = 'E';
             else if (sysIdx == 3) sysCh = 'R';
-            
+
             t_clkCorr clkCorr;
             int prn = satslot_prn(isat + 1);
-            
+
             clkCorr._prn.set(sysCh, prn);
             clkCorr._staID = _staID.toStdString();
             clkCorr._time = _lastTime;
             clkCorr._updateInt = 0;
-            
-            clkCorr._dClk = current_clocks->C0[isat] / t_CST::c; 
+
+            clkCorr._dClk = current_clocks->C0[isat] / t_CST::c;
             clkCorr._dotDClk = 0.0;
             clkCorr._dotDotDClk = 0.0;
-            
-            clkCorr._iod = current_clocks->iode[isat]; 
-            
+
+            clkCorr._iod = current_clocks->iode[isat];
+
             _clkBuffer.append(clkCorr);
         }
     }
@@ -907,6 +941,12 @@ void PPPB2bDecoder::processBufferedCorrections() {
 
     // Check if 30 seconds have passed since last emit
     if (std::abs(_lastTime - _lastEmitTime) >= 5.0) {
+        printf("B2b emit: orbBuf=%d, clkBuf=%d, at=%.1f\n", _orbBuffer.size(), _clkBuffer.size(), (double)_lastTime.gpssec());
+        QString msg = QString("B2b emit: orbBuf=%1, clkBuf=%2, at=%3")
+                        .arg(_orbBuffer.size())
+                        .arg(_clkBuffer.size())
+                        .arg((double)_lastTime.gpssec(), 0, 'f', 1);
+        BNC_CORE->slotMessage(msg.toUtf8(), false);
         if (!_orbBuffer.isEmpty()) {
             // Update time for all buffered orbit corrections to current time
             for (int i = 0; i < _orbBuffer.size(); ++i) {

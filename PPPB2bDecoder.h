@@ -197,13 +197,16 @@ typedef struct {
     char cmake[IF_MAXSAT];
 } ppp_ssr_mask;
 
-class PPPB2bDecoder : public QObject {
+class PPPB2bDecoder : public QObject
+{
     Q_OBJECT
-public:
+ public:
     PPPB2bDecoder();
     ~PPPB2bDecoder();
 
     int input(const uint8_t* sbf_block, int len);
+    void setStaID(const QString& staID);
+    void setVerboseSatPrint(bool enabled);
 
 private:
     uint16_t U2(const uint8_t* p) const;
@@ -254,10 +257,17 @@ private:
     QList<t_orbCorr> _orbBuffer;
     QList<t_clkCorr> _clkBuffer;
     bncTime          _lastEmitTime;
+    uint16_t         _epochWeek;
+    uint32_t         _epochTow;
+    bool             _epochC59Avail;
+    bool             _epochC60Avail;
+    bool             _epochC61Avail;
 
-signals:
+ signals:
     void newOrbCorrections(QList<t_orbCorr>);
     void newClkCorrections(QList<t_clkCorr>);
 };
+
+extern bool g_b2bDebugSatPrint;
 
 #endif
